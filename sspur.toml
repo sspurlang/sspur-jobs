@@ -1,0 +1,5 @@
+[package]
+name = "jobs"
+version = "0.1.0"
+description = "Durable background jobs on SQLite: priorities, delays, unique keys, leases, retries with backoff, dead letters, workers and cron schedules"
+license = "MIT"

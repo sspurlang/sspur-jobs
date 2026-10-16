@@ -1,0 +1,1181 @@
+// jobs: a durable background job queue on SQLite, with leases for crash safety, retries with
+// backoff, a dead letter state, unique jobs, and cron schedules. Every function that reads or
+// writes takes the time as `now`, so tests and replays are deterministic; `enqueue_now`, `work`,
+// `drain` and `run_worker` read the clock. Times are stored as Unix milliseconds.
+
+// ---------- cron expressions ----------
+
+// A parsed cron expression. Each list holds the allowed values of one field in ascending order:
+// seconds 0-59 (only 0 for a 5-field expression), minutes 0-59, hours 0-23, days of the month
+// 1-31, months 1-12 and days of the week 0-6 (0 is Sunday; 7 is read as 0). `any_day` and
+// `any_weekday` record whether those fields started with `*`, which decides how the two day fields
+// combine (see `cron_matches`).
+pub type Cron = {source: Str, seconds: List[Int], minutes: List[Int], hours: List[Int], days: List[Int], months: List[Int], weekdays: List[Int], any_day: Bool, any_weekday: Bool, has_seconds: Bool} derive Eq, Show
+
+fn month_names() -> List[Str]
+= ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+fn weekday_names() -> List[Str]
+= ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+
+fn macro_expr(m: Str) -> Opt[Str]
+= match m.lower
+| "@yearly" | "@annually" => some("0 0 1 1 *")
+| "@monthly" => some("0 0 1 * *")
+| "@weekly" => some("0 0 * * 0")
+| "@daily" | "@midnight" => some("0 0 * * *")
+| "@hourly" => some("0 * * * *")
+| _ => none
+
+fn digits_only(s: Str) -> Bool
+= s != "" and s.chars.all(c => "0123456789".contains(c))
+
+// One value of a field: a number, or a name when the field has names (JAN, MON, ...).
+fn field_value(label: Str, s: Str, lo: Int, hi: Int, names: List[Str], first: Int) -> Res[Int, Str]
+= if digits_only(s) then number_value(label, s, lo, hi) else if names.index_of(s.upper) is some(i) then ok(i + first) else if s == "?" or s.contains("L") or s.contains("W") or s.contains("#") then err("{label}: '{s}' is not supported (it is a Quartz extension)") else err("{label}: '{s}' is not a number" + (if names.is_empty then "" else " or a name like {names[0]}"))
+
+fn number_value(label: Str, s: Str, lo: Int, hi: Int) -> Res[Int, Str]
+= do
+  n = s.to_int.or(-1)
+  if s.len > 4 or n < lo or n > hi then err("{label}: {s} is out of range {lo}-{hi}") else ok(n)
+
+fn step_of(label: Str, s: Str) -> Res[Int, Str]
+= if digits_only(s) and s.len <= 4 and s.to_int.or(0) > 0 then ok(s.to_int.or(1)) else err("{label}: step '{s}' must be a positive number")
+
+// The values of one comma-separated item: `*`, `n`, `a-b`, each optionally `/step`.
+fn field_item(label: Str, item: Str, lo: Int, hi: Int, names: List[Str], first: Int) -> Res[List[Int], Str]
+= do
+  (base, step) = match item.split_once("/")
+  | some((b, s)) => (b, some(s))
+  | none => (item, none)
+  st = match step
+  | some(s) => step_of(label, s)
+  | none => ok(1)
+  match st
+  | err(e) => err(e)
+  | ok(k) => if base == "*" then ok(range(lo, hi + 1, k)) else match base.split_once("-")
+  | some((a, b)) => range_values(label, a, b, lo, hi, names, first, k)
+  | none => match field_value(label, base, lo, hi, names, first)
+  | err(e) => err(e)
+  | ok(v) => ok(if step.is_some() then range(v, hi + 1, k) else [v])
+
+fn range_values(label: Str, a: Str, b: Str, lo: Int, hi: Int, names: List[Str], first: Int, k: Int) -> Res[List[Int], Str]
+= match (field_value(label, a, lo, hi, names, first), field_value(label, b, lo, hi, names, first))
+| (err(e), _) => err(e)
+| (_, err(e)) => err(e)
+| (ok(x), ok(y)) => if x > y then err("{label}: range {a}-{b} is reversed; ranges go from low to high") else ok(range(x, y + 1, k))
+
+fn parse_field(label: Str, text: Str, lo: Int, hi: Int, names: List[Str], first: Int) -> Res[List[Int], Str]
+= do
+  items = text.split(",")
+  if items.any(_ == "") then return err("{label}: empty list item in '{text}'")
+  var out = []
+  for it in items
+    match field_item(label, it, lo, hi, names, first)
+    | err(e) => return err(e)
+    | ok(vs) => out := out + vs
+  ok(out.unique.sort)
+
+// Parses a cron expression: five fields (minute, hour, day of month, month, day of week), six
+// with a seconds field first, or a macro (`@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`,
+// `@midnight`, `@hourly`). Fields take `*`, numbers, `a-b` ranges, `/step` on any of them
+// (`*/15`, `1-30/5`, and `5/15` for `5-59/15`), comma lists, month names `JAN`-`DEC` and day names
+// `SUN`-`SAT` (any case); 0 and 7 are both Sunday. Errors name the field and the offending text.
+pub fn parse_cron(expr: Str) -> Res[Cron, Str]
+  ex parse_cron("*/15 9-17 * * MON-FRI").map(c => c.minutes) == ok([0, 15, 30, 45])
+  ex parse_cron("61 * * * *") == err("minute: 61 is out of range 0-59")
+= do
+  text = expr.trim
+  if text.starts_with("@") and macro_expr(text).is_none() then return err("unknown macro '{text}': use @yearly, @annually, @monthly, @weekly, @daily, @midnight or @hourly")
+  src = macro_expr(text).or(text)
+  fs = src.split(" ").filter(_ != "").flat_map(_.split("\t")).filter(_ != "")
+  if not (fs.len == 5 or fs.len == 6) then return err("expected 5 fields (minute hour day-of-month month day-of-week) or 6 with seconds first, got {fs.len}")
+  six = fs.len == 6
+  f = if six then fs else ["0"] + fs
+  sec = parse_field("second", f[0], 0, 59, [], 0)
+  mi = parse_field("minute", f[1], 0, 59, [], 0)
+  ho = parse_field("hour", f[2], 0, 23, [], 0)
+  dm = parse_field("day of month", f[3], 1, 31, [], 0)
+  mo = parse_field("month", f[4], 1, 12, month_names(), 1)
+  dw = parse_field("day of week", f[5], 0, 7, weekday_names(), 0)
+  match (sec, mi, ho, dm, mo, dw)
+  | (ok(s), ok(m), ok(h), ok(d), ok(mn), ok(w)) => ok(Cron{source: text, seconds: s, minutes: m, hours: h, days: d, months: mn, weekdays: w.map(_ % 7).unique.sort, any_day: f[3].starts_with("*"), any_weekday: f[5].starts_with("*"), has_seconds: six})
+  | (err(e), _, _, _, _, _) | (_, err(e), _, _, _, _) | (_, _, err(e), _, _, _) | (_, _, _, err(e), _, _) | (_, _, _, _, err(e), _) | (_, _, _, _, _, err(e)) => err(e)
+
+fn day_ok(c: Cron, w: Time) -> Bool
+= do
+  dom = c.days.contains(w.day)
+  dow = c.weekdays.contains(w.weekday % 7)
+  if c.any_day or c.any_weekday then dom and dow else dom or dow
+
+fn wall_matches(c: Cron, w: Time) -> Bool
+= c.months.contains(w.month) and day_ok(c, w) and c.hours.contains(w.hour) and c.minutes.contains(w.minute) and c.seconds.contains(w.second)
+
+// Whether the instant `t` (to the second, in UTC) is a fire time of `c`. When both day fields are
+// restricted (neither starts with `*`), a day matches if either matches, as in Vixie cron:
+// `0 0 1 * MON` fires on the 1st and on every Monday. Otherwise both must match.
+pub fn cron_matches(c: Cron, t: Time) -> Bool
+= wall_matches(c, t)
+
+// Whether `t` is a fire time of `c` on the wall clock of the zone `z`.
+pub fn cron_matches_in(c: Cron, z: Zone, t: Time) -> Bool
+= wall_matches(c, z.local(t))
+
+fn trunc_sec(t: Time) -> Time
+= t.sub(millis(t.milli))
+
+fn month_start(y: Int, m: Int) -> Time
+= if m > 12 then datetime(y + 1, 1, 1, 0, 0, 0).get else datetime(y, m, 1, 0, 0, 0).get
+
+fn hour_start(w: Time) -> Time
+= w.date.add(hours(w.hour))
+
+fn minute_start(w: Time) -> Time
+= hour_start(w).add(mins(w.minute))
+
+// The first wall-clock time at or after `start` that matches, within nine years.
+fn search_next(c: Cron, start: Time) -> Opt[Time]
+= do
+  var w = start
+  limit = start.year + 9
+  for i in 0..400000
+    if w.year > limit then return none
+    if not c.months.contains(w.month) then w := month_start(w.year, w.month + 1) else if not day_ok(c, w) then w := w.date.add(days(1)) else if not c.hours.contains(w.hour) then w := hour_start(w).add(hours(1)) else if not c.minutes.contains(w.minute) then w := minute_start(w).add(mins(1)) else if not c.seconds.contains(w.second) then w := w.add(secs(1)) else return some(w)
+  none
+
+// The last wall-clock time at or before `start` that matches, within nine years.
+fn search_prev(c: Cron, start: Time) -> Opt[Time]
+= do
+  var w = start
+  limit = start.year - 9
+  for i in 0..400000
+    if w.year < limit then return none
+    if not c.months.contains(w.month) then w := month_start(w.year, w.month).sub(secs(1)) else if not day_ok(c, w) then w := w.date.sub(secs(1)) else if not c.hours.contains(w.hour) then w := hour_start(w).sub(secs(1)) else if not c.minutes.contains(w.minute) then w := minute_start(w).sub(secs(1)) else if not c.seconds.contains(w.second) then w := w.sub(secs(1)) else return some(w)
+  none
+
+// The instant of the wall time `w` in `z`. A wall time that the clock skips (a daylight saving
+// gap) moves forward by the length of the gap, so 02:30 on a spring-forward night is 03:30; a
+// wall time that happens twice (the autumn overlap) is its first occurrence.
+fn to_instant(z: Zone, w: Time) -> Time
+= match z.utc(w)
+| some(i) => i
+| none => w.sub(z.offset(w.sub(days(1))))
+
+// The first fire time of `c` strictly after `t`, in UTC, or none when there is none within nine
+// years (such as `0 0 30 2 *`).
+pub fn next_fire(c: Cron, t: Time) -> Opt[Time]
+  ex parse_cron("0 9 * * *").map(c => next_fire(c, datetime(2026, 1, 1, 9, 0, 0).get)) == ok(datetime(2026, 1, 2, 9, 0, 0))
+= search_next(c, trunc_sec(t).add(secs(1)))
+
+// The last fire time of `c` at or before `t`, in UTC.
+pub fn prev_fire(c: Cron, t: Time) -> Opt[Time]
+= search_prev(c, trunc_sec(t))
+
+// The next `n` fire times of `c` after `t`, in UTC (fewer if the expression runs out).
+pub fn next_fires(c: Cron, t: Time, n: Int where _ >= 0) -> List[Time]
+  post r.len <= n
+= do
+  var out = []
+  var at = t
+  for i in 0..n
+    match next_fire(c, at)
+    | some(f) => do
+      out := out.push(f)
+      at := f
+    | none => return out
+  out
+
+// The first fire time of `c` strictly after `t` on the wall clock of `z`, as an instant. Skipped
+// and repeated wall times follow the rules of daylight saving time described in the README.
+pub fn next_fire_in(c: Cron, z: Zone, t: Time) -> Opt[Time]
+= do
+  var w = trunc_sec(z.local(t)).add(secs(1))
+  for i in 0..10000
+    match search_next(c, w)
+    | none => return none
+    | some(cand) => do
+      inst = to_instant(z, cand)
+      if inst > t then return some(inst)
+      w := cand.add(secs(1))
+  none
+
+// The last fire time of `c` at or before `t` on the wall clock of `z`, as an instant.
+pub fn prev_fire_in(c: Cron, z: Zone, t: Time) -> Opt[Time]
+= do
+  var w = trunc_sec(z.local(t))
+  for i in 0..10000
+    match search_prev(c, w)
+    | none => return none
+    | some(cand) => do
+      inst = to_instant(z, cand)
+      if inst <= t then return some(inst)
+      w := cand.sub(secs(1))
+  none
+
+// The next `n` fire times of `c` after `t` on the wall clock of `z`.
+pub fn next_fires_in(c: Cron, z: Zone, t: Time, n: Int where _ >= 0) -> List[Time]
+  post r.len <= n
+= do
+  var out = []
+  var at = t
+  for i in 0..n
+    match next_fire_in(c, z, at)
+    | some(f) => do
+      out := out.push(f)
+      at := f
+    | none => return out
+  out
+
+// ---------- types ----------
+
+// Where a job is in its life. `Pending` jobs wait for their `run_at` (a retry is a pending job
+// with attempts already made), `Running` jobs are leased to a worker, and the other three are
+// final: `Completed`, `Dead` (out of attempts or discarded: the dead letter set) and `Cancelled`.
+pub type State = Pending | Running | Completed | Dead | Cancelled derive Eq, Ord, Show
+
+// A job to enqueue. Build one with `job` and change fields with `with`. Smaller `priority` runs
+// first. `run_at` (when set) or `delay` (from the enqueue time) says when it becomes available.
+// With a `unique_key`, enqueueing again in the same queue while a job with that key is pending or
+// running, or within `unique_for` of the first one, returns the existing job instead.
+pub type NewJob = {queue: Str where _.len > 0 and _.len <= 200, kind: Str where _.len > 0 and _.len <= 200, payload: Str, priority: Int where _ >= -1000 and _ <= 1000, run_at: Opt[Time], delay: Duration, max_attempts: Int where _ >= 1 and _ <= 1000, unique_key: Opt[Str], unique_for: Duration} derive Eq, Show
+
+// One failed attempt, as recorded in `Job.errors`.
+pub type AttemptError = {attempt: Int, at: Time, error: Str} derive Eq, Show
+
+// A stored job.
+pub type Job = {id: Int, queue: Str, kind: Str, payload: Str, priority: Int, state: State, run_at: Time, attempts: Int, max_attempts: Int, unique_key: Opt[Str], last_error: Opt[Str], errors: List[AttemptError], created_at: Time, attempted_at: Opt[Time], finished_at: Opt[Time]} derive Eq, Show
+
+// The result of an enqueue: a new job, or the existing job with the same unique key.
+pub type Enqueued = Inserted{id: Int} | Duplicate{id: Int} derive Eq, Show
+
+// A claimed job. `token` identifies this claim: finishing calls with an older token (after the
+// lease expired and another worker claimed the job) change nothing and return false.
+pub type Lease = {job: Job, token: Int, until: Time} derive Eq, Show
+
+// What a handler decided about a job. `Retry` waits by the worker's backoff and `RetryIn` by the
+// given time; both count the attempt, and a job out of attempts goes to `Dead`. `Discard` sends it
+// to `Dead` at once. `Snooze` runs it again later without counting the attempt.
+pub type Outcome = Done | Retry{error: Str} | RetryIn{error: Str, after: Duration} | Discard{error: Str} | Snooze{after: Duration} derive Eq, Show
+
+// How long to wait before the next attempt, by the number of attempts made (1 after the first).
+// `Exponential` doubles `base` up to `cap` and then takes off up to `jitter` (0 to 1) of it at
+// random but repeatably, seeded by the job id; `Linear` waits `step` times the attempt, up to `cap`;
+// `Steps` takes the list in order and repeats its last element.
+pub type Backoff = Exponential{base: Duration, cap: Duration, jitter: F64} | Fixed{delay: Duration} | Linear{step: Duration, cap: Duration} | Steps{delays: List[Duration]} derive Eq, Show
+
+// What a worker needs: the queue it serves, how long a claim lasts before another worker may take
+// the job over, and the backoff for `Retry`.
+pub type Worker = {queue: Str where _.len > 0, lease: Duration, backoff: Backoff} derive Eq, Show
+
+// What `work` did: nothing was available, or it ran a job, with whether the outcome was recorded
+// (false when the lease had been lost).
+pub type Ran = Idle | Processed{job: Job, outcome: Outcome, recorded: Bool} derive Eq, Show
+
+// Filters for `list`: by queue, state and kind (none means any), job ids above `after_id` (for
+// keyset paging), at most `limit` jobs in id order.
+pub type Filter = {queue: Opt[Str], state: Opt[State], kind: Opt[Str], after_id: Int, limit: Int where _ >= 1 and _ <= 1000} derive Eq, Show
+
+// Counts per queue. `available` are pending and due, `scheduled` pending and due later; `oldest_due`
+// is the earliest `run_at` of the available ones, a measure of how far behind the workers are.
+pub type QueueStats = {queue: Str, available: Int, scheduled: Int, running: Int, completed: Int, dead: Int, cancelled: Int, oldest_due: Opt[Time]} derive Eq, Show
+
+type Row = {id: Int, queue: Str, kind: Str, payload: Str, priority: Int, state: Str, run_at: Time, attempts: Int, max_attempts: Int, lease: Int, lease_until: Opt[Time], unique_key: Opt[Str], last_error: Opt[Str], errors: Str, created_at: Time, attempted_at: Opt[Time], finished_at: Opt[Time]}
+
+type CountRow = {queue: Str, state: Str, due: Int, n: Int, oldest: Opt[Time]}
+
+// ---------- schema ----------
+fn schema_steps() -> List[Str]
+= ["create table jobs_jobs (id integer primary key, queue text not null, kind text not null, payload text not null, priority integer not null default 0, state text not null, run_at integer not null, attempts integer not null default 0, max_attempts integer not null, lease integer not null default 0, lease_until integer, unique_key text, unique_until integer, last_error text, errors text not null default '[]', created_at integer not null, attempted_at integer, finished_at integer); create index jobs_jobs_ready on jobs_jobs (queue, state, priority, run_at, id); create index jobs_jobs_unique on jobs_jobs (queue, unique_key) where unique_key is not null; create index jobs_jobs_lease on jobs_jobs (state, lease_until); create index jobs_jobs_finished on jobs_jobs (state, finished_at)", "create table jobs_schedules (name text primary key, cron text not null, zone text not null, queue text not null, kind text not null, payload text not null, priority integer not null, max_attempts integer not null, missed text not null, missed_n integer not null, enabled integer not null, last_fire integer not null, created_at integer not null)"]
+
+// Creates or upgrades the tables this package uses (`jobs_jobs`, `jobs_schedules` and the version
+// table `jobs_schema`), each step in a transaction, and returns how many steps it applied. It is
+// separate from `db.migrate`, so an application's own migrations are not affected. Safe to call on
+// every start, from several processes.
+pub fn migrate(c: Db) -> Int ! db, fail[DbErr]
+  post r >= 0
+= do
+  made = db.exec(c, "create table if not exists jobs_schema (version integer not null)")
+  steps = schema_steps()
+  var applied = 0
+  for i in 0..steps.len
+    done = db.tx(c, () => do
+      v = db.one[Int](c, "select coalesce(max(version), 0) from jobs_schema", [])
+      if v == i then do
+          n = db.exec(c, steps[i])
+          k = db.exec(c, "insert into jobs_schema (version) values (?)", [i + 1])
+          true
+        else false)
+    if done then applied := applied + 1
+  applied
+
+// ---------- enqueueing ----------
+
+// A job for `queue` of kind `kind` with `payload` (usually JSON from `json.encode`): priority 0,
+// available at once, 20 attempts, not unique.
+pub fn job(queue: Str where _.len > 0 and _.len <= 200, kind: Str where _.len > 0 and _.len <= 200, payload: Str) -> NewJob
+  post r.max_attempts == 20
+= NewJob{queue, kind, payload, priority: 0, run_at: none, delay: millis(0), max_attempts: 20, unique_key: none, unique_for: millis(0)}
+
+fn state_name(s: State) -> Str
+= match s
+| Pending => "pending"
+| Running => "running"
+| Completed => "completed"
+| Dead => "dead"
+| Cancelled => "cancelled"
+
+fn state_of(s: Str) -> State
+= match s
+| "running" => Running
+| "completed" => Completed
+| "dead" => Dead
+| "cancelled" => Cancelled
+| _ => Pending
+
+fn to_job(r: Row) -> Job
+= Job{id: r.id, queue: r.queue, kind: r.kind, payload: r.payload, priority: r.priority, state: state_of(r.state), run_at: r.run_at, attempts: r.attempts, max_attempts: r.max_attempts, unique_key: r.unique_key, last_error: r.last_error, errors: json.decode[List[AttemptError]](r.errors).or([]), created_at: r.created_at, attempted_at: r.attempted_at, finished_at: r.finished_at}
+
+fn insert_one(c: Db, j: NewJob, now: Time) -> Enqueued ! db, fail[DbErr]
+= do
+  dup = match j.unique_key
+  | some(k) => db.opt[Int](c, "select id from jobs_jobs where queue = ? and unique_key = ? and (state in ('pending', 'running') or unique_until > ?) order by id desc limit 1", [j.queue, k, now.unix_ms])
+  | none => none
+  match dup
+  | some(id) => Duplicate{id}
+  | none => do
+    at = j.run_at.or(now.add(j.delay))
+    until = j.unique_key.map(k => now.add(j.unique_for).unix_ms)
+    id = db.one[Int](c, "insert into jobs_jobs (queue, kind, payload, priority, state, run_at, max_attempts, unique_key, unique_until, created_at) values (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?) returning id", [j.queue, j.kind, j.payload, j.priority, at.unix_ms, j.max_attempts, j.unique_key, until, now.unix_ms])
+    Inserted{id}
+
+// Adds a job at time `now`, or finds the pending, running or recent job with its unique key.
+pub fn enqueue(c: Db, j: NewJob, now: Time) -> Enqueued ! db, fail[DbErr]
+= db.tx(c, () => insert_one(c, j, now))
+
+// Adds every job in one transaction: all of them or, if one fails, none. The results are in order.
+pub fn enqueue_all(c: Db, js: List[NewJob], now: Time) -> List[Enqueued] ! db, fail[DbErr]
+  post r.len == js.len
+= db.tx(c, () => js.map(j => insert_one(c, j, now)))
+
+// `enqueue` at the current time.
+pub fn enqueue_now(c: Db, j: NewJob) -> Enqueued ! db, fail[DbErr], time
+= enqueue(c, j, now())
+
+// The id of an enqueue result, new or existing.
+pub fn enqueued_id(e: Enqueued) -> Int
+  ex enqueued_id(Duplicate{id: 4}) == 4
+= match e
+| Inserted{id} | Duplicate{id} => id
+
+// ---------- reading ----------
+fn row_cols() -> Str
+= "id, queue, kind, payload, priority, state, run_at, attempts, max_attempts, lease, lease_until, unique_key, last_error, errors, created_at, attempted_at, finished_at"
+
+fn get_row(c: Db, id: Int) -> Opt[Row] ! db, fail[DbErr]
+= db.opt[Row](c, "select {row_cols()} from jobs_jobs where id = ?", [id])
+
+// The job with id `id`.
+pub fn get(c: Db, id: Int) -> Opt[Job] ! db, fail[DbErr]
+= get_row(c, id).map(to_job)
+
+// Any queue, state and kind, from the start, 100 at a time.
+pub fn filter() -> Filter
+  post r.limit == 100
+= Filter{queue: none, state: none, kind: none, after_id: 0, limit: 100}
+
+// Jobs that pass `f`, in id order. For the next page, set `after_id` to the last id returned.
+pub fn list(c: Db, f: Filter) -> List[Job] ! db, fail[DbErr]
+  post r.len <= f.limit
+= db.query[Row](c, "select {row_cols()} from jobs_jobs where id > ? and (? is null or queue = ?) and (? is null or state = ?) and (? is null or kind = ?) order by id limit ?", [f.after_id, f.queue, f.queue, f.state.map(state_name), f.state.map(state_name), f.kind, f.kind, f.limit]).map(to_job)
+
+// Counts for every queue that has jobs, in queue order, at time `now`.
+pub fn stats(c: Db, now: Time) -> List[QueueStats] ! db, fail[DbErr]
+= do
+  rows = db.query[CountRow](c, "select queue, state, (state = 'pending' and run_at <= ?) as due, count(*) as n, min(run_at) as oldest from jobs_jobs group by queue, state, due order by queue", [now.unix_ms])
+  qs = rows.map(_.queue).unique
+  qs.map(q => do
+    mine = rows.filter(_.queue == q)
+    QueueStats{queue: q, available: count_of(mine, "pending", 1), scheduled: count_of(mine, "pending", 0), running: count_of(mine, "running", 0), completed: count_of(mine, "completed", 0), dead: count_of(mine, "dead", 0), cancelled: count_of(mine, "cancelled", 0), oldest_due: oldest_of(mine)})
+
+fn oldest_of(rows: List[CountRow]) -> Opt[Time]
+= match rows.find(r => r.state == "pending" and r.due == 1)
+| some(r) => r.oldest
+| none => none
+
+fn count_of(rows: List[CountRow], s: Str, due: Int) -> Int
+= rows.filter(r => r.state == s and (s != "pending" or r.due == due)).map(_.n).sum
+
+// ---------- claiming and finishing ----------
+fn append_error(errors: Str, attempt: Int, at: Time, error: Str) -> Str
+= json.encode((json.decode[List[AttemptError]](errors).or([]) + [AttemptError{attempt, at, error}]).reverse.take(25).reverse)
+
+// Running jobs of `queue` (or of every queue when none) whose lease ended at or before `now`: back
+// to pending at once, or to dead when that was their last attempt.
+fn rescue_where(c: Db, queue: Opt[Str], now: Time) -> Int ! db, fail[DbErr]
+= do
+  rows = db.query[Row](c, "select {row_cols()} from jobs_jobs where state = 'running' and lease_until <= ? and (? is null or queue = ?)", [now.unix_ms, queue, queue])
+  for r in rows
+    msg = "the lease expired: the worker stopped or took longer than its lease"
+    errs = append_error(r.errors, r.attempts, now, msg)
+    k = if r.attempts >= r.max_attempts then db.exec(c, "update jobs_jobs set state = 'dead', lease_until = null, last_error = ?, errors = ?, finished_at = ? where id = ?", [msg, errs, now.unix_ms, r.id]) else db.exec(c, "update jobs_jobs set state = 'pending', run_at = ?, lease_until = null, last_error = ?, errors = ? where id = ?", [now.unix_ms, msg, errs, r.id])
+  rows.len
+
+// Returns jobs whose lease expired at `now` to their queues (or to dead when they were on their
+// last attempt) and gives how many. `claim` does this for its own queue, so call it only to see
+// crashed work sooner, for example from a periodic task.
+pub fn rescue(c: Db, now: Time) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.tx(c, () => rescue_where(c, none, now))
+
+fn lease_of(r: Row) -> Lease
+= Lease{job: to_job(r), token: r.lease, until: r.lease_until.or(r.run_at)}
+
+// Claims up to `n` available jobs of `queue` for `lease` from `now`, highest priority (smallest
+// number) first, then earliest `run_at`, then oldest. Each claim counts an attempt. The claim is one
+// `BEGIN IMMEDIATE` transaction, so concurrent workers in any number of threads or processes never
+// get the same job; expired leases of the queue are rescued first.
+pub fn claim_many(c: Db, queue: Str, n: Int where _ >= 1 and _ <= 1000, lease: Duration, now: Time) -> List[Lease] ! db, fail[DbErr]
+  post r.len <= n
+= db.tx(c, () => do
+  rescued = rescue_where(c, some(queue), now)
+  ids = db.query[Int](c, "select id from jobs_jobs where queue = ? and state = 'pending' and run_at <= ? order by priority, run_at, id limit ?", [queue, now.unix_ms, n])
+  until = now.add(lease).unix_ms
+  ids.map(id => do
+    k = db.exec(c, "update jobs_jobs set state = 'running', attempts = attempts + 1, lease = lease + 1, lease_until = ?, attempted_at = ? where id = ?", [until, now.unix_ms, id])
+    lease_of(get_row(c, id).get)))
+
+// Claims the next available job of `queue`, as `claim_many` with `n` = 1.
+pub fn claim(c: Db, queue: Str, lease: Duration, now: Time) -> Opt[Lease] ! db, fail[DbErr]
+= claim_many(c, queue, 1, lease, now).first
+
+fn owned(c: Db, l: Lease) -> Opt[Row] ! db, fail[DbErr]
+= db.opt[Row](c, "select {row_cols()} from jobs_jobs where id = ? and lease = ? and state = 'running'", [l.job.id, l.token])
+
+// Extends a lease to `by` after `now` (a heartbeat for long jobs). None when the lease was lost.
+pub fn extend(c: Db, l: Lease, by: Duration, now: Time) -> Opt[Lease] ! db, fail[DbErr]
+= db.tx(c, () => do
+  match owned(c, l)
+  | none => none
+  | some(r) => do
+    k = db.exec(c, "update jobs_jobs set lease_until = ? where id = ?", [now.add(by).unix_ms, r.id])
+    some(lease_of(get_row(c, r.id).get)))
+
+// Marks a leased job completed. False when the lease was lost (the job was rescued and claimed
+// again, or cancelled).
+pub fn complete(c: Db, l: Lease, now: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_jobs set state = 'completed', lease_until = null, finished_at = ? where id = ? and lease = ? and state = 'running'", [now.unix_ms, l.job.id, l.token]) == 1
+
+fn retry_or_die(c: Db, l: Lease, error: Str, after: Duration, now: Time) -> Bool ! db, fail[DbErr]
+= db.tx(c, () => do
+  match owned(c, l)
+  | none => false
+  | some(r) => do
+    errs = append_error(r.errors, r.attempts, now, error)
+    k = if r.attempts >= r.max_attempts then db.exec(c, "update jobs_jobs set state = 'dead', lease_until = null, last_error = ?, errors = ?, finished_at = ? where id = ?", [error, errs, now.unix_ms, r.id]) else db.exec(c, "update jobs_jobs set state = 'pending', run_at = ?, lease_until = null, last_error = ?, errors = ? where id = ?", [now.add(after).unix_ms, error, errs, r.id])
+    true)
+
+// Records a failed attempt: the job runs again after `backoff`, or goes to dead when it has used
+// its attempts. False when the lease was lost.
+pub fn fail_attempt(c: Db, l: Lease, error: Str, backoff: Backoff, now: Time) -> Bool ! db, fail[DbErr]
+= retry_or_die(c, l, error, backoff_delay(backoff, l.job.attempts, l.job.id), now)
+
+// Records a failed attempt that should run again after `after` (or go to dead when it has used its
+// attempts).
+pub fn retry_in(c: Db, l: Lease, error: Str, after: Duration, now: Time) -> Bool ! db, fail[DbErr]
+= retry_or_die(c, l, error, after, now)
+
+// Sends a leased job to dead at once, whatever attempts it has left.
+pub fn discard(c: Db, l: Lease, error: Str, now: Time) -> Bool ! db, fail[DbErr]
+= db.tx(c, () => do
+  match owned(c, l)
+  | none => false
+  | some(r) => db.exec(c, "update jobs_jobs set state = 'dead', lease_until = null, last_error = ?, errors = ?, finished_at = ? where id = ?", [error, append_error(r.errors, r.attempts, now, error), now.unix_ms, r.id]) == 1)
+
+// Puts a leased job back to run after `after` without counting this attempt.
+pub fn snooze(c: Db, l: Lease, after: Duration, now: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_jobs set state = 'pending', attempts = attempts - 1, run_at = ?, lease_until = null where id = ? and lease = ? and state = 'running'", [now.add(after).unix_ms, l.job.id, l.token]) == 1
+
+// Records a handler's outcome for a leased job, using `backoff` for `Retry`.
+pub fn finish(c: Db, l: Lease, o: Outcome, backoff: Backoff, now: Time) -> Bool ! db, fail[DbErr]
+= match o
+| Done => complete(c, l, now)
+| Retry{error} => fail_attempt(c, l, error, backoff, now)
+| RetryIn{error, after} => retry_in(c, l, error, after, now)
+| Discard{error} => discard(c, l, error, now)
+| Snooze{after} => snooze(c, l, after, now)
+
+// ---------- managing jobs ----------
+
+// Cancels a pending or running job. A worker that still holds it can no longer record a result.
+pub fn cancel(c: Db, id: Int, now: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_jobs set state = 'cancelled', lease_until = null, finished_at = ? where id = ? and state in ('pending', 'running')", [now.unix_ms, id]) == 1
+
+// Makes a dead or cancelled job pending again, with its attempts reset and available at `now`.
+pub fn retry(c: Db, id: Int, now: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_jobs set state = 'pending', attempts = 0, run_at = ?, finished_at = null where id = ? and state in ('dead', 'cancelled')", [now.unix_ms, id]) == 1
+
+// `retry` for every dead job of `queue`; gives how many.
+pub fn retry_dead(c: Db, queue: Str, now: Time) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.exec(c, "update jobs_jobs set state = 'pending', attempts = 0, run_at = ?, finished_at = null where queue = ? and state = 'dead'", [now.unix_ms, queue])
+
+// Moves a pending job to run at `at` (sooner or later). False for jobs in other states.
+pub fn reschedule(c: Db, id: Int, at: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_jobs set run_at = ? where id = ? and state = 'pending'", [at.unix_ms, id]) == 1
+
+// Deletes a job in any state.
+pub fn delete(c: Db, id: Int) -> Bool ! db, fail[DbErr]
+= db.exec(c, "delete from jobs_jobs where id = ?", [id]) == 1
+
+// Deletes jobs in the final state `s` (`Completed`, `Dead` or `Cancelled`) that finished before
+// `before`, and gives how many. Pending and running jobs are never purged.
+pub fn purge(c: Db, s: State, before: Time) -> Int ! db, fail[DbErr]
+  post r >= 0
+= if s == Pending or s == Running then 0 else db.exec(c, "delete from jobs_jobs where state = ? and finished_at < ?", [state_name(s), before.unix_ms])
+
+// ---------- backoff ----------
+
+// Exponential backoff from 1 second up to 1 hour, with a quarter of jitter.
+pub fn default_backoff() -> Backoff
+= Exponential{base: secs(1), cap: hours(1), jitter: 0.25}
+
+// The wait before the attempt after `attempt` attempts, for a job seeded by `seed` (its id): the
+// same inputs always give the same wait, so retries are spread out but repeatable in tests.
+pub fn backoff_delay(b: Backoff, attempt: Int where _ >= 0, seed: Int) -> Duration
+  post r.ms >= 0
+  ex backoff_delay(Fixed{delay: secs(5)}, 3, 1) == secs(5)
+  ex backoff_delay(Exponential{base: secs(1), cap: mins(1), jitter: 0.0}, 4, 1) == secs(8)
+= match b
+| Fixed{delay} => nonneg(delay)
+| Linear{step, cap} => nonneg(millis(min(max(step.ms, 0).checked_mul(max(attempt, 1)).or(cap.ms), cap.ms)))
+| Steps{delays} => if delays.is_empty then millis(0) else nonneg(delays[clamp(attempt - 1, 0, delays.len - 1)])
+| Exponential{base, cap, jitter} => do
+  var d = max(base.ms, 0)
+  for i in 1..min(max(attempt, 1), 63)
+    d := if d >= cap.ms / 2 then cap.ms else d * 2
+  full = min(d, max(cap.ms, 0))
+  (u, _) = rand_f64(seed.wrapping_mul(1000003).wrapping_add(attempt))
+  j = clamp(jitter, 0.0, 1.0)
+  millis(full - (full.to_f64 * j * u).floor)
+
+fn nonneg(d: Duration) -> Duration
+= if d.ms < 0 then millis(0) else d
+
+// ---------- workers ----------
+
+// A worker for `queue` with a 5 minute lease and the default backoff.
+pub fn worker(queue: Str where _.len > 0) -> Worker
+  post r.queue == queue
+= Worker{queue, lease: mins(5), backoff: default_backoff()}
+
+// Claims one job of the worker's queue at `now`, runs `handler` on it and records the outcome at
+// `now`. Handlers report failure through their `Outcome`; a handler that traps or never returns
+// leaves the job leased, and it is retried when the lease expires.
+pub fn work_at[e](c: Db, w: Worker, handler: Job -> Outcome ! e, now: Time) -> Ran ! db, fail[DbErr], e
+= match claim(c, w.queue, w.lease, now)
+| none => Idle
+| some(l) => do
+  o = handler(l.job)
+  Processed{job: l.job, outcome: o, recorded: finish(c, l, o, w.backoff, now)}
+
+// `work_at` with the clock: claims now and records the outcome when the handler returns.
+pub fn work[e](c: Db, w: Worker, handler: Job -> Outcome ! e) -> Ran ! db, fail[DbErr], time, e
+= match claim(c, w.queue, w.lease, now())
+| none => Idle
+| some(l) => do
+  o = handler(l.job)
+  Processed{job: l.job, outcome: o, recorded: finish(c, l, o, w.backoff, now())}
+
+// Runs `work` until the queue has nothing available or `max` jobs ran, and gives how many ran.
+// For concurrency, start several in `par` and pass a top-level function (or a lambda written
+// inside the task), since tasks can't share function values:
+// `for i in par(0..4)` then `jobs.drain(c, w, send_email, 1000)`.
+pub fn drain[e](c: Db, w: Worker, handler: Job -> Outcome ! e, max: Int where _ >= 0) -> Int ! db, fail[DbErr], time, e
+  post r >= 0 and r <= max
+= do
+  var n = 0
+  for i in 0..max
+    match work(c, w, handler)
+    | Idle => return n
+    | Processed{} => n := n + 1
+  n
+
+// Serves the worker's queue until `stop` holds a non-zero value: runs jobs while there are any and
+// sleeps `idle_ms` when there are none. Gives how many jobs ran. Set `stop` from another task, or
+// from a signal-handling path of the program, to finish after the current job.
+pub fn run_worker[e](c: Db, w: Worker, handler: Job -> Outcome ! e, stop: Atomic[Int], idle_ms: Int where _ >= 1) -> Int ! db, fail[DbErr], time, conc, div, e
+  post r >= 0
+= do
+  var n = 0
+  while stop.load == 0
+    match work(c, w, handler)
+    | Idle => sleep_ms(idle_ms)
+    | Processed{} => n := n + 1
+  n
+
+// ---------- scheduled jobs ----------
+
+// What `tick` does about fire times that passed while nothing ticked (the process was down):
+// `CatchUp` enqueues each of them, at most the `limit` most recent; `Latest` enqueues only the most
+// recent; `Skip` enqueues the most recent only if it is at most `grace` old, and drops the rest.
+pub type Missed = CatchUp{limit: Int} | Latest | Skip{grace: Duration} derive Eq, Show
+
+// A recurring job: `cron` (see `parse_cron`) on the wall clock of the IANA zone `zone` (`"UTC"`,
+// `"Europe/Berlin"`, or a fixed offset such as `"+05:30"`), enqueueing `kind` with `payload` into
+// `queue`. `name` identifies it.
+pub type Schedule = {name: Str where _.len > 0 and _.len <= 200, cron: Str, zone: Str, queue: Str where _.len > 0 and _.len <= 200, kind: Str where _.len > 0 and _.len <= 200, payload: Str, priority: Int where _ >= -1000 and _ <= 1000, max_attempts: Int where _ >= 1 and _ <= 1000, missed: Missed, enabled: Bool} derive Eq, Show
+
+// One run that `tick` enqueued: the schedule, its fire time and the enqueue result.
+pub type Fired = {schedule: Str, at: Time, result: Enqueued} derive Eq, Show
+
+type SchedRow = {name: Str, cron: Str, zone: Str, queue: Str, kind: Str, payload: Str, priority: Int, max_attempts: Int, missed: Str, missed_n: Int, enabled: Bool, last_fire: Time}
+
+// A schedule named `name` in UTC, enabled, with priority 0, 20 attempts and `Latest` for missed
+// runs.
+pub fn schedule(name: Str where _.len > 0 and _.len <= 200, cron: Str, queue: Str where _.len > 0 and _.len <= 200, kind: Str where _.len > 0 and _.len <= 200, payload: Str) -> Schedule
+  post r.enabled and r.zone == "UTC"
+= Schedule{name, cron, zone: "UTC", queue, kind, payload, priority: 0, max_attempts: 20, missed: Latest, enabled: true}
+
+fn missed_name(m: Missed) -> (Str, Int)
+= match m
+| CatchUp{limit} => ("catch_up", limit)
+| Latest => ("latest", 0)
+| Skip{grace} => ("skip", grace.ms)
+
+fn missed_of(s: Str, n: Int) -> Missed
+= match s
+| "catch_up" => CatchUp{limit: n}
+| "skip" => Skip{grace: millis(n)}
+| _ => Latest
+
+fn to_schedule(r: SchedRow) -> Schedule
+= Schedule{name: r.name, cron: r.cron, zone: r.zone, queue: r.queue, kind: r.kind, payload: r.payload, priority: r.priority, max_attempts: r.max_attempts, missed: missed_of(r.missed, r.missed_n), enabled: r.enabled}
+
+// Adds or replaces the schedule `s.name`, checking its cron expression and zone. Its first run is
+// the first fire time after `now`; replacing a schedule with the same expression and zone keeps
+// its progress, so nothing fires twice. An error names what is wrong.
+pub fn put_schedule(c: Db, s: Schedule, now: Time) -> Res[Unit, Str] ! db, fail[DbErr], time
+= match (parse_cron(s.cron), time_zone(s.zone))
+| (err(e), _) => err("cron: " + e)
+| (_, err(e)) => err("zone {s.zone}: {e}")
+| (ok(_), ok(_)) => if s.missed is CatchUp{limit} and (limit < 1 or limit > 10000) then err("missed: CatchUp limit must be from 1 to 10000") else do
+  (m, n) = missed_name(s.missed)
+  db.tx(c, () => do
+    old = db.opt[SchedRow](c, "select * from jobs_schedules where name = ?", [s.name])
+    last = match old
+    | some(o) => if o.cron == s.cron and o.zone == s.zone then o.last_fire else now
+    | none => now
+    k = db.exec(c, "insert or replace into jobs_schedules (name, cron, zone, queue, kind, payload, priority, max_attempts, missed, missed_n, enabled, last_fire, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [s.name, s.cron, s.zone, s.queue, s.kind, s.payload, s.priority, s.max_attempts, m, n, s.enabled, last.unix_ms, now.unix_ms]))
+  ok(())
+
+// Removes a schedule. Jobs it already enqueued stay.
+pub fn remove_schedule(c: Db, name: Str) -> Bool ! db, fail[DbErr]
+= db.exec(c, "delete from jobs_schedules where name = ?", [name]) == 1
+
+// Turns a schedule on or off. Turning one on counts from `now`, so the time it was off is not
+// caught up.
+pub fn set_enabled(c: Db, name: Str, enabled: Bool, now: Time) -> Bool ! db, fail[DbErr]
+= db.exec(c, "update jobs_schedules set enabled = ?, last_fire = case when ? and enabled = 0 then ? else last_fire end where name = ?", [enabled, enabled, now.unix_ms, name]) == 1
+
+// Every schedule, by name.
+pub fn schedules(c: Db) -> List[Schedule] ! db, fail[DbErr]
+= db.query[SchedRow](c, "select * from jobs_schedules order by name", []).map(to_schedule)
+
+// The fire times of `c` in `z` after `last` and at or before `now` that `missed` lets through,
+// oldest first. `tick` enqueues these.
+pub fn due_fires(c: Cron, z: Zone, last: Time, now: Time, missed: Missed) -> List[Time]
+= do
+  limit = match missed
+  | CatchUp{limit} => max(limit, 1)
+  | _ => 1
+  var out = []
+  var at = now
+  for i in 0..limit
+    match prev_fire_in(c, z, at)
+    | some(f) => if f > last then do
+        out := out.push(f)
+        at := f.sub(millis(1))
+      else return keep(out.reverse, missed, now)
+    | none => return keep(out.reverse, missed, now)
+  keep(out.reverse, missed, now)
+
+fn keep(fs: List[Time], m: Missed, now: Time) -> List[Time]
+= match m
+| Skip{grace} => fs.filter(f => now.since(f).ms <= grace.ms)
+| _ => fs
+
+fn tick_one(c: Db, r: SchedRow, now: Time) -> List[Fired] ! db, fail[DbErr], time
+= match (parse_cron(r.cron), time_zone(r.zone))
+| (ok(cr), ok(z)) => do
+  fires = due_fires(cr, z, r.last_fire, now, missed_of(r.missed, r.missed_n))
+  out = fires.map(f => Fired{schedule: r.name, at: f, result: insert_one(c, NewJob{queue: r.queue, kind: r.kind, payload: r.payload, priority: r.priority, run_at: some(f), delay: millis(0), max_attempts: r.max_attempts, unique_key: some("schedule:{r.name}:{f.unix_ms}"), unique_for: days(7)}, now)})
+  k = db.exec(c, "update jobs_schedules set last_fire = ? where name = ?", [now.unix_ms, r.name])
+  out
+| _ => []
+
+// Enqueues every run of every enabled schedule that is due at `now`, once: each run gets the unique
+// key `schedule:NAME:MILLIS` and the schedule's progress moves to `now` in the same transaction, so
+// ticking from several processes, or twice, enqueues nothing twice. Call it every few seconds or
+// every minute; missed runs follow each schedule's `missed`.
+pub fn tick(c: Db, now: Time) -> List[Fired] ! db, fail[DbErr], time
+= db.tx(c, () => db.query[SchedRow](c, "select * from jobs_schedules where enabled = 1 and last_fire < ? order by name", [now.unix_ms]).flat_map(r => tick_one(c, r, now)))
+
+// ---------- tests ----------
+fn t0() -> Time
+= datetime(2026, 1, 1, 12, 0, 0).get
+
+fn fresh() -> Db ! db, fail[DbErr]
+= do
+  c = db.open(":memory:")
+  n = migrate(c)
+  c
+
+fn cr(s: Str) -> Cron
+= match parse_cron(s)
+| ok(c) => c
+| err(e) => Cron{source: e, seconds: [], minutes: [], hours: [], days: [], months: [], weekdays: [], any_day: false, any_weekday: false, has_seconds: false}
+
+fn utc(y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int) -> Time
+= datetime(y, mo, d, h, mi, s).get
+
+fn ok_done(j: Job) -> Outcome
+= Done
+
+fn always_retry(j: Job) -> Outcome
+= Retry{error: "boom {j.attempts}"}
+
+test cron_fields = cr("*/15 9-17 * * MON-FRI") == Cron{source: "*/15 9-17 * * MON-FRI", seconds: [0], minutes: [0, 15, 30, 45], hours: [9, 10, 11, 12, 13, 14, 15, 16, 17], days: (1..32).map(i => i), months: (1..13).map(i => i), weekdays: [1, 2, 3, 4, 5], any_day: true, any_weekday: false, has_seconds: false}
+
+test cron_lists_steps = cr("0,30 */6 1-10/3 */2 *").hours == [0, 6, 12, 18] and cr("0,30 */6 1-10/3 */2 *").days == [1, 4, 7, 10] and cr("0,30 */6 1-10/3 */2 *").months == [1, 3, 5, 7, 9, 11] and cr("5/15 * * * *").minutes == [5, 20, 35, 50] and cr("1,1,3 * * * *").minutes == [1, 3]
+
+test cron_names = cr("0 0 * jan,Mar-may *").months == [1, 3, 4, 5] and cr("0 0 * * sun,SAT").weekdays == [0, 6] and cr("0 0 * * 7").weekdays == [0] and cr("0 0 * * 5-7").weekdays == [0, 5, 6] and cr("0 0 * * 0-7").weekdays == [0, 1, 2, 3, 4, 5, 6]
+
+test cron_macros = cr("@yearly") == (cr("0 0 1 1 *") with source := "@yearly") and cr("@annually").months == [1] and cr("@monthly").days == [1] and cr("@weekly").weekdays == [0] and cr("@daily").hours == [0] and cr("@midnight").hours == [0] and cr("@hourly").hours.len == 24 and cr("@HOURLY").minutes == [0]
+
+test cron_seconds = cr("*/20 * * * * *").seconds == [0, 20, 40] and cr("*/20 * * * * *").has_seconds and not cr("* * * * *").has_seconds and cr("  0   9\t* * *  ").hours == [9]
+
+test cron_errors = parse_cron("* * * *") == err("expected 5 fields (minute hour day-of-month month day-of-week) or 6 with seconds first, got 4") and parse_cron("") == err("expected 5 fields (minute hour day-of-month month day-of-week) or 6 with seconds first, got 0") and parse_cron("* 24 * * *") == err("hour: 24 is out of range 0-23") and parse_cron("* * 0 * *") == err("day of month: 0 is out of range 1-31") and parse_cron("* * * 13 *") == err("month: 13 is out of range 1-12") and parse_cron("* * * * 8") == err("day of week: 8 is out of range 0-7") and parse_cron("60 * * * * *") == err("second: 60 is out of range 0-59")
+
+test cron_error_text = parse_cron("1,,2 * * * *") == err("minute: empty list item in '1,,2'") and parse_cron("* 5-1 * * *") == err("hour: range 5-1 is reversed; ranges go from low to high") and parse_cron("*/0 * * * *") == err("minute: step '0' must be a positive number") and parse_cron("*/x * * * *") == err("minute: step 'x' must be a positive number") and parse_cron("* * * foo *") == err("month: 'foo' is not a number or a name like JAN") and parse_cron("x * * * *") == err("minute: 'x' is not a number") and parse_cron("* * L * *") == err("day of month: 'L' is not supported (it is a Quartz extension)") and parse_cron("* * ? * *").is_err and parse_cron("* * * * MON#2").is_err and parse_cron("@reboot").is_err and parse_cron("-1 * * * *").is_err and parse_cron("99999 * * * *") == err("minute: 99999 is out of range 0-59")
+
+test cron_next = next_fire(cr("0 9 * * *"), utc(2026, 1, 1, 8, 59, 59)) == some(utc(2026, 1, 1, 9, 0, 0)) and next_fire(cr("0 9 * * *"), utc(2026, 1, 1, 9, 0, 0)) == some(utc(2026, 1, 2, 9, 0, 0)) and next_fire(cr("* * * * *"), utc(2026, 12, 31, 23, 59, 30)) == some(utc(2027, 1, 1, 0, 0, 0)) and next_fire(cr("0 0 1 1 *"), utc(2026, 6, 1, 0, 0, 0)) == some(utc(2027, 1, 1, 0, 0, 0))
+
+test cron_next_millis = next_fire(cr("* * * * * *"), utc(2026, 1, 1, 0, 0, 0).add(millis(500))) == some(utc(2026, 1, 1, 0, 0, 1))
+
+test cron_leap_and_never = next_fire(cr("0 0 29 2 *"), utc(2097, 3, 1, 0, 0, 0)) == some(utc(2104, 2, 29, 0, 0, 0)) and next_fire(cr("0 0 30 2 *"), utc(2026, 1, 1, 0, 0, 0)) == none and next_fire(cr("0 0 31 4 *"), t0()) == none and prev_fire(cr("0 0 30 2 *"), t0()) == none
+
+test cron_or_rule = next_fires(cr("0 0 1 * MON"), utc(2026, 6, 1, 0, 0, 0), 5) == [utc(2026, 6, 8, 0, 0, 0), utc(2026, 6, 15, 0, 0, 0), utc(2026, 6, 22, 0, 0, 0), utc(2026, 6, 29, 0, 0, 0), utc(2026, 7, 1, 0, 0, 0)] and next_fire(cr("0 0 */2 * MON"), utc(2026, 6, 1, 0, 0, 0)) == some(utc(2026, 6, 15, 0, 0, 0)) and next_fire(cr("0 0 1-31/2 * MON"), utc(2026, 6, 1, 0, 0, 0)) == some(utc(2026, 6, 3, 0, 0, 0)) and next_fire(cr("0 0 13 * FRI"), utc(2026, 2, 1, 0, 0, 0)) == some(utc(2026, 2, 6, 0, 0, 0))
+
+test cron_and_rule_with_star = next_fire(cr("0 0 * * FRI"), utc(2026, 2, 1, 0, 0, 0)) == some(utc(2026, 2, 6, 0, 0, 0)) and next_fire(cr("0 0 1-7 * *"), utc(2026, 2, 8, 0, 0, 0)) == some(utc(2026, 3, 1, 0, 0, 0))
+
+test cron_prev = prev_fire(cr("0 9 * * *"), utc(2026, 1, 1, 9, 0, 0)) == some(utc(2026, 1, 1, 9, 0, 0)) and prev_fire(cr("0 9 * * *"), utc(2026, 1, 1, 8, 59, 59)) == some(utc(2025, 12, 31, 9, 0, 0)) and prev_fire(cr("0 0 1 * MON"), utc(2026, 6, 1, 0, 0, 1)) == some(utc(2026, 6, 1, 0, 0, 0)) and prev_fire(cr("0 0 31 * *"), utc(2026, 3, 30, 0, 0, 0)) == some(utc(2026, 1, 31, 0, 0, 0))
+
+test cron_next_fires = next_fires(cr("*/20 * * * * *"), t0(), 4) == [t0().add(secs(20)), t0().add(secs(40)), t0().add(secs(60)), t0().add(secs(80))] and next_fires(cr("* * * * *"), t0(), 0) == [] and next_fires(cr("0 0 30 2 *"), t0(), 3) == []
+
+test cron_matches_utc = cron_matches(cr("30 9 * * MON-FRI"), utc(2026, 1, 5, 9, 30, 0)) and not cron_matches(cr("30 9 * * MON-FRI"), utc(2026, 1, 4, 9, 30, 0)) and not cron_matches(cr("30 9 * * *"), utc(2026, 1, 5, 9, 30, 1))
+
+test cron_zones = do
+  ny = time_zone("America/New_York").or(fixed_zone(0))
+  next_fires_in(cr("30 2 * * *"), ny, utc(2026, 3, 6, 12, 0, 0), 3) == [utc(2026, 3, 7, 7, 30, 0), utc(2026, 3, 8, 7, 30, 0), utc(2026, 3, 9, 6, 30, 0)] and next_fires_in(cr("30 1 * * *"), ny, utc(2026, 10, 31, 12, 0, 0), 3) == [utc(2026, 11, 1, 5, 30, 0), utc(2026, 11, 2, 6, 30, 0), utc(2026, 11, 3, 6, 30, 0)] and prev_fire_in(cr("30 2 * * *"), ny, utc(2026, 3, 8, 7, 0, 0)) == some(utc(2026, 3, 7, 7, 30, 0)) and cron_matches_in(cr("0 9 * * *"), ny, utc(2026, 1, 5, 14, 0, 0)) and not cron_matches_in(cr("0 9 * * *"), ny, utc(2026, 1, 5, 9, 0, 0))
+
+test cron_overlap_once = do
+  ny = time_zone("America/New_York").or(fixed_zone(0))
+  next_fires_in(cr("15 * * * *"), ny, utc(2026, 11, 1, 4, 0, 0), 3) == [utc(2026, 11, 1, 4, 15, 0), utc(2026, 11, 1, 5, 15, 0), utc(2026, 11, 1, 7, 15, 0)]
+
+test cron_fixed_zone = next_fire_in(cr("0 9 * * *"), fixed_zone(330), utc(2026, 1, 1, 0, 0, 0)) == some(utc(2026, 1, 1, 3, 30, 0)) and next_fires_in(cr("0 9 * * *"), fixed_zone(-60), t0(), 0) == []
+
+test migrate_once = catch do
+  c = db.open(":memory:")
+  a = migrate(c)
+  b = migrate(c)
+  a == 2 and b == 0 and db.one[Int](c, "select count(*) from jobs_schema", []) == 2
+| _ => false
+
+test enqueue_and_get = catch do
+  c = fresh()
+  e = enqueue(c, job("mail", "welcome", "\{\"to\":\"a@b.c\"}"), t0())
+  j = get(c, enqueued_id(e)).get
+  e is Inserted{} and j.queue == "mail" and j.kind == "welcome" and j.payload == "\{\"to\":\"a@b.c\"}" and j.state == Pending and j.attempts == 0 and j.max_attempts == 20 and j.run_at == t0() and j.created_at == t0() and j.errors == [] and get(c, 999) == none
+| _ => false
+
+test job_defaults = job("q", "k", "") == NewJob{queue: "q", kind: "k", payload: "", priority: 0, run_at: none, delay: millis(0), max_attempts: 20, unique_key: none, unique_for: millis(0)} and enqueued_id(Inserted{id: 3}) == 3
+
+test priority_then_time_order = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "a", ""), t0())
+  b = enqueue(c, job("q", "b", "") with priority := -5, t0().add(secs(1)))
+  d = enqueue(c, job("q", "d", "") with run_at := some(t0().sub(secs(10))), t0())
+  w = t0().add(secs(5))
+  order = claim_many(c, "q", 10, mins(1), w).map(l => l.job.kind)
+  order == ["b", "d", "a"]
+| _ => false
+
+test delay_and_run_at = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "later", "") with delay := mins(5), t0())
+  b = enqueue(c, job("q", "at", "") with run_at := some(t0().add(hours(1))), t0())
+  none1 = claim(c, "q", mins(1), t0().add(mins(4)))
+  one = claim(c, "q", mins(1), t0().add(mins(5)))
+  d = one.map(l => complete(c, l, t0().add(mins(5)))) == some(true)
+  none1 == none and one.map(l => l.job.kind) == some("later") and d and claim(c, "q", mins(1), t0().add(mins(59))) == none and claim(c, "q", mins(1), t0().add(hours(1))).map(l => l.job.kind) == some("at")
+| _ => false
+
+test queues_are_separate = catch do
+  c = fresh()
+  a = enqueue(c, job("one", "k", ""), t0())
+  claim(c, "two", mins(1), t0()) == none and claim(c, "one", mins(1), t0()).is_some()
+| _ => false
+
+test unique_while_pending = catch do
+  c = fresh()
+  u = job("q", "k", "1") with unique_key := some("user:7")
+  a = enqueue(c, u, t0())
+  b = enqueue(c, u with payload := "2", t0())
+  other_queue = enqueue(c, u with queue := "r", t0())
+  l = claim(c, "q", mins(1), t0()).get
+  while_running = enqueue(c, u, t0())
+  done = complete(c, l, t0())
+  after = enqueue(c, u, t0())
+  a == Inserted{id: 1} and b == Duplicate{id: 1} and (other_queue is Inserted{}) and while_running == Duplicate{id: 1} and done and (after is Inserted{}) and enqueued_id(after) != 1
+| _ => false
+
+test unique_window = catch do
+  c = fresh()
+  u = job("q", "k", "") with unique_key := some("daily"), unique_for := hours(24)
+  a = enqueue(c, u, t0())
+  l = claim(c, "q", mins(1), t0()).get
+  d = complete(c, l, t0())
+  within = enqueue(c, u, t0().add(hours(23)))
+  later = enqueue(c, u, t0().add(hours(25)))
+  within == Duplicate{id: 1} and (later is Inserted{})
+| _ => false
+
+test enqueue_all_in_order = catch do
+  c = fresh()
+  rs = enqueue_all(c, [job("q", "a", ""), job("q", "b", "") with unique_key := some("x"), job("q", "c", "") with unique_key := some("x")], t0())
+  rs == [Inserted{id: 1}, Inserted{id: 2}, Duplicate{id: 2}] and enqueue_all(c, [], t0()) == []
+| _ => false
+
+test enqueue_all_rolls_back = catch do
+  c = fresh()
+  r = catch db.tx(c, () => do
+    made = enqueue_all(c, [job("q", "a", ""), job("q", "b", "")], t0())
+    db.exec(c, "insert into jobs_jobs (id) values (1)", []))
+  | Constraint{} => -1
+  | _ => -2
+  r == -1 and list(c, filter()) == []
+| _ => false
+
+test enqueue_now_uses_clock = catch do
+  c = fresh()
+  e = enqueue_now(c, job("q", "k", ""))
+  get(c, enqueued_id(e)).map(j => j.created_at.year >= 2026) == some(true)
+| _ => false
+
+test claim_leases = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  l = claim(c, "q", mins(2), t0()).get
+  l.until == t0().add(mins(2)) and l.token == 1 and l.job.state == Running and l.job.attempts == 1 and l.job.attempted_at == some(t0()) and claim(c, "q", mins(2), t0()) == none
+| _ => false
+
+test claim_many_limits = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..5).map(i => job("q", "k{i}", "")), t0())
+  first = claim_many(c, "q", 3, mins(1), t0())
+  rest = claim_many(c, "q", 3, mins(1), t0())
+  first.len == 3 and rest.len == 2 and claim_many(c, "q", 3, mins(1), t0()) == [] and (first + rest).map(_.job.id).unique.len == 5
+| _ => false
+
+test lease_expiry_rescues = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  l1 = claim(c, "q", mins(1), t0()).get
+  still = claim(c, "q", mins(1), t0().add(secs(59)))
+  l2 = claim(c, "q", mins(1), t0().add(mins(1))).get
+  late = complete(c, l1, t0().add(mins(1)))
+  j = get(c, l1.job.id).get
+  still == none and l2.token == 2 and l2.job.attempts == 2 and not late and l2.job.last_error == some("the lease expired: the worker stopped or took longer than its lease") and l2.job.errors.len == 1 and complete(c, l2, t0().add(mins(1))) and get(c, l1.job.id).map(x => x.state) == some(Completed) and j.state == Running
+| _ => false
+
+test lease_expiry_on_last_attempt_is_dead = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", "") with max_attempts := 1, t0())
+  l = claim(c, "q", mins(1), t0()).get
+  n = rescue(c, t0().add(mins(2)))
+  n == 1 and get(c, l.job.id).map(j => (j.state, j.finished_at)) == some((Dead, some(t0().add(mins(2))))) and rescue(c, t0().add(mins(3))) == 0
+| _ => false
+
+test extend_heartbeat = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  l = claim(c, "q", mins(1), t0()).get
+  l2 = extend(c, l, mins(5), t0().add(secs(50))).get
+  not_stolen = claim(c, "q", mins(1), t0().add(mins(2)))
+  l2.until == t0().add(secs(50)).add(mins(5)) and l2.token == l.token and not_stolen == none and complete(c, l2, t0().add(mins(3)))
+| _ => false
+
+test extend_lost_lease = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  l = claim(c, "q", mins(1), t0()).get
+  gone = cancel(c, l.job.id, t0())
+  gone and extend(c, l, mins(5), t0()) == none and not complete(c, l, t0()) and not fail_attempt(c, l, "x", default_backoff(), t0()) and not snooze(c, l, mins(1), t0()) and not discard(c, l, "x", t0()) and not retry_in(c, l, "x", secs(1), t0())
+| _ => false
+
+test fail_backs_off = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  l = claim(c, "q", mins(1), t0()).get
+  b = Fixed{delay: secs(30)}
+  f = fail_attempt(c, l, "smtp down", b, t0())
+  j = get(c, l.job.id).get
+  f and j.state == Pending and j.run_at == t0().add(secs(30)) and j.last_error == some("smtp down") and j.errors == [AttemptError{attempt: 1, at: t0(), error: "smtp down"}] and claim(c, "q", mins(1), t0().add(secs(29))) == none and claim(c, "q", mins(1), t0().add(secs(30))).map(x => x.job.attempts) == some(2)
+| _ => false
+
+test fail_until_dead = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", "") with max_attempts := 3, t0())
+  var t = t0()
+  var ok_all = true
+  for i in 0..3
+    l = claim(c, "q", mins(1), t).get
+    ok_all := ok_all and fail_attempt(c, l, "e{i}", Fixed{delay: secs(1)}, t)
+    t := t.add(secs(1))
+  j = get(c, 1).get
+  ok_all and j.state == Dead and j.attempts == 3 and j.errors.map(_.error) == ["e0", "e1", "e2"] and j.finished_at == some(t0().add(secs(2))) and claim(c, "q", mins(1), t.add(hours(1))) == none
+| _ => false
+
+test retry_in_and_discard = catch do
+  c = fresh()
+  made = enqueue_all(c, [job("q", "a", ""), job("q", "b", "")], t0())
+  la = claim(c, "q", mins(1), t0()).get
+  lb = claim(c, "q", mins(1), t0()).get
+  r = retry_in(c, la, "rate limited", mins(10), t0())
+  d = discard(c, lb, "bad payload", t0())
+  r and d and get(c, la.job.id).map(j => (j.state, j.run_at)) == some((Pending, t0().add(mins(10)))) and get(c, lb.job.id).map(j => (j.state, j.last_error)) == some((Dead, some("bad payload")))
+| _ => false
+
+test snooze_keeps_attempts = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", "") with max_attempts := 1, t0())
+  l = claim(c, "q", mins(1), t0()).get
+  s = snooze(c, l, mins(3), t0())
+  j = get(c, 1).get
+  l2 = claim(c, "q", mins(1), t0().add(mins(3))).get
+  s and j.state == Pending and j.attempts == 0 and j.run_at == t0().add(mins(3)) and l2.job.attempts == 1 and l2.token == 2
+| _ => false
+
+test finish_dispatches = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..5).map(i => job("q", "k{i}", "")), t0())
+  ls = claim_many(c, "q", 5, mins(1), t0())
+  os = [Done, Retry{error: "r"}, RetryIn{error: "ri", after: secs(9)}, Discard{error: "d"}, Snooze{after: secs(4)}]
+  rs = (0..5).map(i => finish(c, ls[i], os[i], Fixed{delay: secs(2)}, t0()))
+  states = (1..6).map(i => get(c, i).map(j => (j.state, j.run_at)).get)
+  rs.all(x => x) and states == [(Completed, t0()), (Pending, t0().add(secs(2))), (Pending, t0().add(secs(9))), (Dead, t0()), (Pending, t0().add(secs(4)))]
+| _ => false
+
+test cancel_and_retry = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", ""), t0())
+  x = cancel(c, 1, t0())
+  again = cancel(c, 1, t0())
+  st = get(c, 1).map(j => j.state)
+  back = retry(c, 1, t0().add(mins(1)))
+  j = get(c, 1).get
+  x and not again and st == some(Cancelled) and back and j.state == Pending and j.attempts == 0 and j.finished_at == none and j.run_at == t0().add(mins(1)) and not retry(c, 1, t0()) and not cancel(c, 42, t0())
+| _ => false
+
+test retry_dead_queue = catch do
+  c = fresh()
+  made = enqueue_all(c, [job("q", "a", "") with max_attempts := 1, job("q", "b", "") with max_attempts := 1, job("r", "c", "") with max_attempts := 1], t0())
+  ls = claim_many(c, "q", 5, mins(1), t0()) + claim_many(c, "r", 5, mins(1), t0())
+  fs = ls.map(l => fail_attempt(c, l, "x", default_backoff(), t0()))
+  n = retry_dead(c, "q", t0())
+  n == 2 and get(c, 3).map(j => j.state) == some(Dead) and claim_many(c, "q", 5, mins(1), t0()).len == 2
+| _ => false
+
+test reschedule_pending = catch do
+  c = fresh()
+  a = enqueue(c, job("q", "k", "") with delay := hours(1), t0())
+  r = reschedule(c, 1, t0())
+  l = claim(c, "q", mins(1), t0())
+  r and l.is_some() and not reschedule(c, 1, t0())
+| _ => false
+
+test delete_and_purge = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..4).map(i => job("q", "k{i}", "")), t0())
+  ls = claim_many(c, "q", 3, mins(1), t0())
+  d1 = complete(c, ls[0], t0())
+  d2 = complete(c, ls[1], t0().add(hours(2)))
+  x = discard(c, ls[2], "x", t0())
+  p = purge(c, Completed, t0().add(hours(1)))
+  p0 = purge(c, Pending, t0().add(days(9)))
+  p1 = purge(c, Running, t0().add(days(9)))
+  pd = purge(c, Dead, t0().add(secs(1)))
+  del = delete(c, 4)
+  p == 1 and p0 == 0 and p1 == 0 and pd == 1 and del and not delete(c, 4) and list(c, filter()).map(_.id) == [2]
+| _ => false
+
+test list_filters_and_pages = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..7).map(i => job(if i % 2 == 0 then "even" else "odd", if i < 3 then "small" else "big", "")), t0())
+  l = claim(c, "even", mins(1), t0()).get
+  all = list(c, filter())
+  page1 = list(c, filter() with limit := 3)
+  page2 = list(c, filter() with limit := 3, after_id := 3)
+  evens = list(c, filter() with queue := some("even"))
+  running = list(c, filter() with state := some(Running))
+  big_odd = list(c, filter() with queue := some("odd"), kind := some("big"))
+  all.len == 7 and page1.map(_.id) == [1, 2, 3] and page2.map(_.id) == [4, 5, 6] and evens.map(_.id) == [1, 3, 5, 7] and running.map(_.id) == [l.job.id] and big_odd.map(_.id) == [4, 6] and filter().limit == 100
+| _ => false
+
+test stats_per_queue = catch do
+  c = fresh()
+  made = enqueue_all(c, [job("a", "k", ""), job("a", "k", "") with run_at := some(t0().sub(mins(5))), job("a", "k", "") with delay := hours(1), job("b", "k", ""), job("b", "k", "") with max_attempts := 1], t0())
+  lb = claim_many(c, "b", 2, mins(1), t0())
+  f = discard(c, lb[1], "x", t0())
+  la = claim(c, "a", mins(1), t0()).get
+  cn = cancel(c, 1, t0())
+  s = stats(c, t0())
+  s == [QueueStats{queue: "a", available: 0, scheduled: 1, running: 1, completed: 0, dead: 0, cancelled: 1, oldest_due: none}, QueueStats{queue: "b", available: 0, scheduled: 0, running: 1, completed: 0, dead: 1, cancelled: 0, oldest_due: none}] and la.job.id == 2 and stats(c, t0().add(hours(2))).map(_.scheduled) == [0, 0] and stats(c, t0().add(hours(2)))[0].oldest_due == some(t0().add(hours(1))) and stats(fresh(), t0()) == []
+| _ => false
+
+test backoff_shapes = backoff_delay(Fixed{delay: secs(5)}, 1, 7) == secs(5) and backoff_delay(Fixed{delay: secs(-5)}, 1, 7) == millis(0) and backoff_delay(Linear{step: secs(10), cap: secs(25)}, 1, 0) == secs(10) and backoff_delay(Linear{step: secs(10), cap: secs(25)}, 2, 0) == secs(20) and backoff_delay(Linear{step: secs(10), cap: secs(25)}, 9, 0) == secs(25) and backoff_delay(Steps{delays: [secs(1), secs(5), mins(1)]}, 1, 0) == secs(1) and backoff_delay(Steps{delays: [secs(1), secs(5), mins(1)]}, 3, 0) == mins(1) and backoff_delay(Steps{delays: [secs(1), secs(5), mins(1)]}, 30, 0) == mins(1) and backoff_delay(Steps{delays: []}, 3, 0) == millis(0) and backoff_delay(Steps{delays: [secs(2)]}, 0, 0) == secs(2)
+
+test backoff_exponential = do
+  e = Exponential{base: secs(1), cap: mins(1), jitter: 0.0}
+  [0, 1, 2, 3, 4, 5, 6, 7, 1000, 9223372036854775807].map(a => backoff_delay(e, a, 3).ms) == [1000, 1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000] and backoff_delay(Exponential{base: secs(1), cap: millis(500), jitter: 0.0}, 1, 0) == millis(500)
+
+test backoff_jitter_is_bounded_and_repeatable = do
+  e = Exponential{base: secs(10), cap: hours(1), jitter: 0.5}
+  ds = (1..200).map(s => backoff_delay(e, 3, s).ms)
+  ds.all(d => d > 20000 and d <= 40000) and ds.unique.len > 100 and backoff_delay(e, 3, 77) == backoff_delay(e, 3, 77) and (1..50).map(s => backoff_delay(Exponential{base: secs(1), cap: secs(4), jitter: 2.0}, 9, s).ms).all(d => d >= 0 and d <= 4000)
+
+test default_backoff_shape = default_backoff() == Exponential{base: secs(1), cap: hours(1), jitter: 0.25} and worker("q") == Worker{queue: "q", lease: mins(5), backoff: default_backoff()}
+
+test work_at_runs_handlers = catch do
+  c = fresh()
+  made = enqueue_all(c, [job("q", "a", ""), job("q", "b", "")], t0())
+  w = worker("q") with backoff := Fixed{delay: secs(1)}
+  r1 = work_at(c, w, ok_done, t0())
+  r2 = work_at(c, w, always_retry, t0())
+  r3 = work_at(c, w, ok_done, t0())
+  r1 is Processed{job, outcome: Done, recorded: true} and job.kind == "a" and (r2 is Processed{outcome: Retry{error: "boom 1"}, recorded: true}) and r3 == Idle and get(c, 2).map(j => j.run_at) == some(t0().add(secs(1)))
+| _ => false
+
+test work_and_drain = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..10).map(i => job("q", "k", "{i}")), t0().sub(secs(1)))
+  one = work(c, worker("q"), ok_done)
+  n = drain(c, worker("q"), ok_done, 4)
+  m = drain(c, worker("q"), ok_done, 100)
+  one is Processed{recorded: true} and n == 4 and m == 5 and drain(c, worker("q"), ok_done, 100) == 0 and drain(c, worker("q"), ok_done, 0) == 0
+| _ => false
+
+test run_worker_stops = catch do
+  c = fresh()
+  made = enqueue_all(c, (0..3).map(i => job("q", "k", "{i}")), t0().sub(secs(1)))
+  stop = atomic(0)
+  n = run_worker(c, worker("q"), j => do
+    stop.store(if j.payload == "1" then 1 else 0)
+    Done, stop, 5)
+  stopped = atomic(1)
+  n == 2 and run_worker(c, worker("q"), ok_done, stopped, 5) == 0 and list(c, filter() with state := some(Pending)).len == 1
+| _ => false
+
+fn count_job(c: Db, j: Job) -> Outcome ! db, fail[DbErr]
+= do
+  n = db.exec(c, "insert into seen (job) values (?)", [j.id])
+  Done
+
+fn stress(path: Str) -> Bool ! db, fail[DbErr], fs, time, conc
+= do
+  gone = [remove_file(path), remove_file(path + "-wal"), remove_file(path + "-shm")]
+  c = db.open(path)
+  n = migrate(c)
+  t = db.exec(c, "create table seen (job integer not null)")
+  made = enqueue_all(c, (0..300).map(i => job("stress", "k", "{i}") with priority := i % 7), now().sub(secs(1)))
+  w = worker("stress")
+  counts = atomic(0)
+  for i in par(0..6)
+    counts.add(drain(c, w, j => count_job(c, j), 1000))
+  total = counts.load
+  dup = db.one[Int](c, "select count(*) from (select job from seen group by job having count(*) > 1)", [])
+  distinct = db.one[Int](c, "select count(distinct job) from seen", [])
+  done = db.one[Int](c, "select count(*) from jobs_jobs where state = 'completed' and attempts = 1", [])
+  db.close(c)
+  cleaned = [remove_file(path), remove_file(path + "-wal"), remove_file(path + "-shm")]
+  total == 300 and dup == 0 and distinct == 300 and done == 300
+
+test no_double_processing = catch stress(env_var("TMPDIR").or("/tmp").replace("\\", "/") + "/sspur-jobs-stress-{now_ms()}.db")
+| _ => false
+
+test schedule_defaults = schedule("nightly", "0 3 * * *", "q", "report", "\{}") == Schedule{name: "nightly", cron: "0 3 * * *", zone: "UTC", queue: "q", kind: "report", payload: "\{}", priority: 0, max_attempts: 20, missed: Latest, enabled: true}
+
+test put_schedule_validates = catch do
+  c = fresh()
+  bad = put_schedule(c, schedule("x", "61 * * * *", "q", "k", ""), t0())
+  zone = put_schedule(c, schedule("x", "* * * * *", "q", "k", "") with zone := "Mars/Olympus", t0())
+  limit = put_schedule(c, schedule("x", "* * * * *", "q", "k", "") with missed := CatchUp{limit: 0}, t0())
+  good = put_schedule(c, schedule("x", "* * * * *", "q", "k", ""), t0())
+  bad == err("cron: minute: 61 is out of range 0-59") and zone.is_err and zone.map(u => 0).or(1) == 1 and limit == err("missed: CatchUp limit must be from 1 to 10000") and good == ok(()) and schedules(c).map(_.name) == ["x"]
+| _ => false
+
+test tick_enqueues_once = catch do
+  c = fresh()
+  p = put_schedule(c, schedule("five", "*/5 * * * *", "q", "report", "p") with priority := 2, max_attempts := 4, t0())
+  early = tick(c, t0().add(mins(4)))
+  f1 = tick(c, t0().add(mins(5)))
+  again = tick(c, t0().add(mins(5)))
+  f2 = tick(c, t0().add(mins(7)))
+  j = get(c, 1).get
+  early == [] and f1 == [Fired{schedule: "five", at: t0().add(mins(5)), result: Inserted{id: 1}}] and again == [] and f2 == [] and j.run_at == t0().add(mins(5)) and j.priority == 2 and j.max_attempts == 4 and j.kind == "report" and j.unique_key == some("schedule:five:{t0().add(mins(5)).unix_ms}")
+| _ => false
+
+test tick_missed_policies = catch do
+  c = fresh()
+  a = put_schedule(c, schedule("latest", "0 * * * *", "q", "k", ""), t0())
+  b = put_schedule(c, schedule("catch", "0 * * * *", "q", "k", "") with missed := CatchUp{limit: 3}, t0())
+  d = put_schedule(c, schedule("skip", "0 * * * *", "q", "k", "") with missed := Skip{grace: mins(10)}, t0())
+  e = put_schedule(c, schedule("skip2", "0 * * * *", "q", "k", "") with missed := Skip{grace: mins(10)}, t0())
+  late = t0().add(hours(5)).add(mins(30))
+  fs = tick(c, late)
+  on_time = tick(c, t0().add(hours(6)).add(mins(5)))
+  fs.filter(f => f.schedule == "catch").map(f => f.at) == [t0().add(hours(3)), t0().add(hours(4)), t0().add(hours(5))] and fs.filter(f => f.schedule == "latest").map(f => f.at) == [t0().add(hours(5))] and fs.filter(f => f.schedule == "skip").len == 0 and on_time.map(f => f.schedule).sort == ["catch", "latest", "skip", "skip2"]
+| _ => false
+
+test due_fires_pure = do
+  c = cr("0 * * * *")
+  z = fixed_zone(0)
+  due_fires(c, z, t0(), t0().add(hours(3)), CatchUp{limit: 10}) == [t0().add(hours(1)), t0().add(hours(2)), t0().add(hours(3))] and due_fires(c, z, t0(), t0().add(mins(59)), Latest) == [] and due_fires(c, z, t0().sub(secs(1)), t0(), Latest) == [t0()] and due_fires(c, z, t0(), t0(), Latest) == [] and due_fires(c, z, t0(), t0().add(hours(3)), Skip{grace: hours(1)}) == [t0().add(hours(3))] and due_fires(c, z, t0(), t0().add(hours(3)).add(mins(1)), Skip{grace: secs(30)}) == []
+
+test schedules_enable_remove = catch do
+  c = fresh()
+  a = put_schedule(c, schedule("h", "0 * * * *", "q", "k", ""), t0())
+  off = set_enabled(c, "h", false, t0())
+  none_off = tick(c, t0().add(hours(3)))
+  on = set_enabled(c, "h", true, t0().add(hours(3)).add(mins(30)))
+  after_on = tick(c, t0().add(hours(3)).add(mins(40)))
+  next = tick(c, t0().add(hours(4)))
+  r = remove_schedule(c, "h")
+  off and none_off == [] and on and after_on == [] and next.map(f => f.at) == [t0().add(hours(4))] and r and not remove_schedule(c, "h") and schedules(c) == [] and not set_enabled(c, "h", true, t0())
+| _ => false
+
+test put_schedule_keeps_progress = catch do
+  c = fresh()
+  a = put_schedule(c, schedule("h", "0 * * * *", "q", "k", ""), t0())
+  f = tick(c, t0().add(hours(1)))
+  b = put_schedule(c, schedule("h", "0 * * * *", "q", "k2", ""), t0().add(hours(1)).add(mins(1)))
+  again = tick(c, t0().add(hours(1)).add(mins(2)))
+  f.len == 1 and again == [] and schedules(c).map(s => s.kind) == ["k2"]
+| _ => false
+
+test schedule_in_zone = catch do
+  c = fresh()
+  a = put_schedule(c, schedule("berlin", "0 9 * * *", "q", "k", "") with zone := "Europe/Berlin", utc(2026, 7, 1, 0, 0, 0))
+  fs = tick(c, utc(2026, 7, 1, 7, 0, 0))
+  fs.map(f => f.at) == [utc(2026, 7, 1, 7, 0, 0)] and schedules(c).map(s => s.zone) == ["Europe/Berlin"]
+| _ => false
